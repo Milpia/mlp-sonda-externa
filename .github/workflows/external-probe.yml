@@ -1,0 +1,140 @@
+name: External Probe
+
+# Sondeo externo de Milpia: comprueba desde fuera del VPS que el VPS y Traefik
+# responden, y que lo que debe estar cerrado a internet lo sigue estando.
+#
+# Vive en este repositorio público, aparte del de infraestructura, por dos
+# motivos:
+#   - En un repositorio público Actions no consume minutos de la cuota.
+#   - Lo dispara cada hora un cron externo (cron-job.org) con un token que
+#     solo alcanza este repositorio. El horario propio de GitHub (`schedule`)
+#     no sirve: corría 3 a 5 veces al día en vez de 24.
+#
+# No lleva `schedule` a propósito: GitHub desactiva los workflows programados
+# de un repositorio público tras 60 días sin commits, y con ellos el disparo
+# manual.
+#
+# Sondea access.milpia.com:8443, que va sin proxy de Cloudflare: los hosts con
+# proxy responden 403 (challenge) a las IPs de datacenter de GitHub.
+#
+# Todo lo que este workflow imprime es público. No imprime secretos: usa dos,
+# los webhooks de aviso, y uno opcional (HEARTBEAT_URL).
+#
+# La copia de referencia de este archivo está en Milpia/mlp-infrastructure
+# (infrastructure/shared/observability/sonda-externa/). Se cambia allí, por
+# PR, y se vuelve a publicar con instalar.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      simular_fallo:
+        description: "Añade un host que no existe, para probar el aviso"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Si un disparo llega con el anterior aún corriendo, espera: nunca dos a la vez.
+concurrency:
+  group: external-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Sondear los hosts públicos
+        id: sondeo
+        env:
+          SIMULAR_FALLO: ${{ inputs.simular_fallo }}
+        run: |
+          objetivos=(
+            "https://access.milpia.com:8443/"
+          )
+          if [ "$SIMULAR_FALLO" = "true" ]; then
+            objetivos+=("https://no-existe.milpia.com")
+          fi
+
+          fallos=()
+          for url in "${objetivos[@]}"; do
+            # -f: cualquier respuesta >= 400 cuenta como fallo.
+            if curl -fsSL -o /dev/null --max-time 10 --retry 2 --retry-delay 5 \
+                 -A "milpia-external-probe" "$url"; then
+              echo "OK    $url"
+            else
+              echo "FALLA $url"
+              fallos+=("$url")
+            fi
+          done
+
+          # identity solo se publica /health. Aquí el fallo es que respondan:
+          # un 2xx o un 3xx significa que la regla de Traefik se perdió. Un
+          # 403, un 404 o que el host ni resuelva son respuestas correctas.
+          cerradas=(
+            "https://identity.milpia.com/"
+            "https://identity.milpia.com/v1/session"
+          )
+          for url in "${cerradas[@]}"; do
+            codigo=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' \
+                       -A "milpia-external-probe" "$url" 2>/dev/null || true)
+            case "$codigo" in
+              2*|3*)
+                echo "FALLA $url responde $codigo y debería estar cerrada"
+                fallos+=("$url(expuesta)")
+                ;;
+              *)
+                echo "OK    $url cerrada (${codigo:-sin respuesta})"
+                ;;
+            esac
+          done
+
+          # ya existe y antes respondía en estas rutas, así que aquí se exige
+          # el 403 exacto de la regla de Traefik: un 401 o un 404 querrían
+          # decir que el pedido llegó a la app.
+          bloqueadas=(
+            "https://core.milpia.com/"
+            "https://core.milpia.com/v1/session"
+          )
+          for url in "${bloqueadas[@]}"; do
+            codigo=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' \
+                       -A "milpia-external-probe" "$url" 2>/dev/null || true)
+            if [ "$codigo" = "403" ]; then
+              echo "OK    $url bloqueada (403)"
+            else
+              echo "FALLA $url responde ${codigo:-sin respuesta} y debería dar 403"
+              fallos+=("$url(no-bloqueada)")
+            fi
+          done
+
+          echo "fallos=${fallos[*]}" >> "$GITHUB_OUTPUT"
+          [ ${#fallos[@]} -eq 0 ]
+
+      - name: Avisar a Discord y Slack
+        if: failure() && steps.sondeo.outputs.fallos != ''
+        env:
+          DISCORD_URL: ${{ secrets.ALERT_DISCORD_WEBHOOK_URL }}
+          SLACK_URL: ${{ secrets.ALERT_SLACK_WEBHOOK_URL }}
+          FALLOS: ${{ steps.sondeo.outputs.fallos }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          texto=$(printf '[CRÍTICO] sondeo externo · no responde\nHosts: %s\nQué mirar primero: access.milpia.com:8443 va directo al VPS, sin Cloudflare. ¿El VPS está encendido? Revisa healthchecks.io y la consola de Hetzner\nEjecución: %s' "$FALLOS" "$RUN_URL")
+
+          status=0
+          jq -n --arg t "$texto" '{content: $t}' \
+            | curl -fsS --max-time 10 -H 'Content-Type: application/json' -d @- "$DISCORD_URL" || status=1
+          jq -n --arg t "$texto" '{text: $t}' \
+            | curl -fsS --max-time 10 -H 'Content-Type: application/json' -d @- "$SLACK_URL" || status=1
+          exit $status
+
+      # Opcional: latido de la propia sonda. Si el cron externo deja de
+      # dispararla, healthchecks.io avisa. Sin el secreto, este paso no hace nada.
+      - name: Latido de la sonda
+        if: success()
+        env:
+          HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+        run: |
+          if [ -n "$HEARTBEAT_URL" ]; then
+            curl -fsS --max-time 10 --retry 2 -o /dev/null "$HEARTBEAT_URL" || echo "no se pudo enviar el latido"
+          fi
